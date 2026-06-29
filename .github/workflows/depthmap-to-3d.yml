@@ -1,4 +1,4 @@
-name: Depthmap → 3D Model
+name: Image → 3D Model
 
 on:
   workflow_dispatch:
@@ -22,46 +22,176 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check input files exist
+      - name: Find input image
         run: |
-          if [ ! -f "depthmap.png" ]; then
-            echo "ERROR: depthmap.png not found in repo root"
-            echo "Upload your depthmap.png to the repo root first"
+          IMG=$(ls input/*.jpg input/*.jpeg input/*.png input/*.webp 2>/dev/null | grep -v .gitkeep | head -1)
+          if [ -z "$IMG" ]; then
+            echo "ERROR: no image found in input/ folder"
+            echo "Upload any photo (jpg, png, webp) to the input/ folder and re-run"
             exit 1
           fi
-          if [ ! -f "photo.jpg" ] && [ ! -f "photo.png" ] && [ ! -f "photo.jpeg" ]; then
-            echo "ERROR: no photo found. Upload photo.jpg, photo.png, or photo.jpeg to repo root"
-            exit 1
-          fi
-          PHOTO=$(ls photo.jpg photo.png photo.jpeg 2>/dev/null | head -1)
-          echo "Found photo: $PHOTO"
-          echo "PHOTO=$PHOTO" >> $GITHUB_ENV
+          echo "Found: $IMG"
+          echo "IMG=$IMG" >> $GITHUB_ENV
 
       - name: Install dependencies
-        run: pip install pillow numpy
-
-      - name: Run depthmap → OBJ conversion
         run: |
-          python scripts/depthmap_to_obj.py \
-            --depth depthmap.png \
-            --photo ${{ env.PHOTO }} \
-            --out result.obj \
-            --height ${{ github.event.inputs.height_scale }} \
-            --scale ${{ github.event.inputs.scale }}
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install timm pillow numpy opencv-python-headless
 
-      - name: Commit output files
+      - name: Download MiDaS model
         run: |
+          python - <<'PYEOF'
+          import torch
+          print("Downloading MiDaS DPT_Large model...")
+          midas = torch.hub.load("intel-isl/MiDaS", "DPT_Large", trust_repo=True)
+          print("Done")
+          PYEOF
+
+      - name: Generate depth map with MiDaS
+        run: |
+          python - <<'PYEOF'
+          import os, torch, cv2
+          import numpy as np
+          from PIL import Image
+
+          img_path = os.environ["IMG"]
+          print(f"Processing: {img_path}")
+
+          # Load MiDaS
+          midas = torch.hub.load("intel-isl/MiDaS", "DPT_Large", trust_repo=True)
+          device = torch.device("cpu")
+          midas.to(device).eval()
+          transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+          transform = transforms.dpt_transform
+
+          # Load and process image
+          img = cv2.imread(img_path)
+          img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+          # Resize if too large (saves memory on CPU)
+          h, w = img_rgb.shape[:2]
+          if max(h, w) > 800:
+              scale = 800 / max(h, w)
+              img_rgb = cv2.resize(img_rgb, (int(w*scale), int(h*scale)))
+              print(f"Resized to {img_rgb.shape[1]}x{img_rgb.shape[0]}")
+
+          input_batch = transform(img_rgb).to(device)
+
+          print("Running MiDaS depth estimation (this takes a few mins on CPU)...")
+          with torch.no_grad():
+              prediction = midas(input_batch)
+              prediction = torch.nn.functional.interpolate(
+                  prediction.unsqueeze(1),
+                  size=img_rgb.shape[:2],
+                  mode="bicubic",
+                  align_corners=False,
+              ).squeeze()
+
+          depth = prediction.cpu().numpy()
+          depth_norm = (depth - depth.min()) / (depth.max() - depth.min())
+
+          # Save depthmap
+          os.makedirs("output", exist_ok=True)
+          depth_img = Image.fromarray((depth_norm * 255).astype("uint8"))
+          depth_img.save("output/depthmap.png")
+
+          # Save resized photo for texture
+          Image.fromarray(img_rgb).save("output/photo_resized.png")
+          np.save("output/depth.npy", depth_norm)
+          print("Depth map saved")
+          PYEOF
+
+      - name: Convert depthmap → OBJ mesh
+        run: |
+          python - <<'PYEOF'
+          import os, numpy as np
+          from PIL import Image
+
+          height_scale = float(os.environ.get("HEIGHT_SCALE", "0.4"))
+          scale = int(os.environ.get("MESH_SCALE", "4"))
+
+          depth_norm = np.load("output/depth.npy")
+          photo = Image.open("output/photo_resized.png").convert("RGB")
+
+          H, W = depth_norm.shape
+          MW, MH = W // scale, H // scale
+
+          from PIL import Image as PILImage
+          depth_small = np.array(PILImage.fromarray(depth_norm).resize((MW, MH), PILImage.LANCZOS), dtype=np.float32)
+          # normalize again after resize
+          depth_small = (depth_small - depth_small.min()) / (depth_small.max() - depth_small.min() + 1e-8)
+          photo_small = np.array(photo.resize((MW, MH), PILImage.LANCZOS), dtype=np.float32) / 255.0
+
+          print(f"Building mesh: {MW}x{MH} = {MW*MH:,} verts")
+
+          positions, colors, uvs, indices = [], [], [], []
+          for y in range(MH):
+              for x in range(MW):
+                  vx = (x / (MW-1)) * 2 - 1
+                  vy = -((y / (MH-1)) * 2 - 1)
+                  vz = float(depth_small[y, x]) * height_scale
+                  positions.append((vx, vy, vz))
+                  r, g, b = photo_small[y, x, :3]
+                  colors.append((float(r), float(g), float(b)))
+                  uvs.append((x/(MW-1), 1-y/(MH-1)))
+
+          for y in range(MH-1):
+              for x in range(MW-1):
+                  a=y*MW+x; b=y*MW+x+1; c=(y+1)*MW+x+1; d=(y+1)*MW+x
+                  indices.extend([(a,b,c),(a,c,d)])
+
+          # Normals
+          pos_arr = np.array(positions)
+          norms = np.zeros_like(pos_arr)
+          for tri in indices:
+              a,b,c = pos_arr[tri[0]], pos_arr[tri[1]], pos_arr[tri[2]]
+              n = np.cross(b-a, c-a)
+              l = np.linalg.norm(n)
+              if l > 0:
+                  n /= l
+                  norms[tri[0]] += n; norms[tri[1]] += n; norms[tri[2]] += n
+          lens = np.linalg.norm(norms, axis=1, keepdims=True)
+          lens[lens==0] = 1
+          norms /= lens
+
+          # Save texture
+          photo.save("output/result_texture.png")
+
+          # Write MTL
+          with open("output/result.mtl", "w") as f:
+              f.write("newmtl material0\nmap_Kd result_texture.png\n")
+
+          # Write OBJ
+          with open("output/result.obj", "w") as f:
+              f.write("# Image → 3D mesh via MiDaS + GitHub Actions\nmtllib result.mtl\n\n")
+              for v,c in zip(positions, colors):
+                  f.write(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f} {c[0]:.3f} {c[1]:.3f} {c[2]:.3f}\n")
+              f.write("\n")
+              for uv in uvs:
+                  f.write(f"vt {uv[0]:.4f} {uv[1]:.4f}\n")
+              f.write("\n")
+              for n in norms:
+                  f.write(f"vn {n[0]:.4f} {n[1]:.4f} {n[2]:.4f}\n")
+              f.write("\nusemtl material0\n\n")
+              for tri in indices:
+                  a,b,c = tri[0]+1,tri[1]+1,tri[2]+1
+                  f.write(f"f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}\n")
+
+          print(f"✅ result.obj — {len(positions):,} verts, {len(indices):,} tris")
+          PYEOF
+        env:
+          HEIGHT_SCALE: ${{ github.event.inputs.height_scale }}
+          MESH_SCALE: ${{ github.event.inputs.scale }}
+
+      - name: Wipe input, commit output
+        run: |
+          rm -f input/*.jpg input/*.jpeg input/*.png input/*.webp
+          touch input/.gitkeep output/.gitkeep
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add result.obj result_texture.png result.mtl
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Generate 3D model from depthmap (height=${{ github.event.inputs.height_scale }}, scale=${{ github.event.inputs.scale }})"
-            git push origin HEAD
-          fi
+          git add -f output/ input/
+          git diff --cached --quiet || git commit -m "3D model generated (height=${{ github.event.inputs.height_scale }}, scale=${{ github.event.inputs.scale }})"
+          git push origin HEAD
 
       - name: Done
-        run: |
-          echo "✅ Done! Download result.obj + result_texture.png from the repo"
-          echo "Load result.obj in viewer/3d_viewer.html"
+        run: echo "✅ Download result.obj + result_texture.png from the output/ folder. Load in viewer/3d_viewer.html"
