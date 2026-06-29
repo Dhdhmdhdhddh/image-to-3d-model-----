@@ -1,0 +1,67 @@
+name: Depthmap → 3D Model
+
+on:
+  workflow_dispatch:
+    inputs:
+      height_scale:
+        description: 'Height exaggeration (0.1 = flat, 1.0 = very dramatic)'
+        default: '0.4'
+        required: false
+      scale:
+        description: 'Mesh density (2 = dense, 8 = low poly)'
+        default: '4'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check input files exist
+        run: |
+          if [ ! -f "depthmap.png" ]; then
+            echo "ERROR: depthmap.png not found in repo root"
+            echo "Upload your depthmap.png to the repo root first"
+            exit 1
+          fi
+          if [ ! -f "photo.jpg" ] && [ ! -f "photo.png" ] && [ ! -f "photo.jpeg" ]; then
+            echo "ERROR: no photo found. Upload photo.jpg, photo.png, or photo.jpeg to repo root"
+            exit 1
+          fi
+          PHOTO=$(ls photo.jpg photo.png photo.jpeg 2>/dev/null | head -1)
+          echo "Found photo: $PHOTO"
+          echo "PHOTO=$PHOTO" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: pip install pillow numpy
+
+      - name: Run depthmap → OBJ conversion
+        run: |
+          python scripts/depthmap_to_obj.py \
+            --depth depthmap.png \
+            --photo ${{ env.PHOTO }} \
+            --out result.obj \
+            --height ${{ github.event.inputs.height_scale }} \
+            --scale ${{ github.event.inputs.scale }}
+
+      - name: Commit output files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add result.obj result_texture.png result.mtl
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Generate 3D model from depthmap (height=${{ github.event.inputs.height_scale }}, scale=${{ github.event.inputs.scale }})"
+            git push origin HEAD
+          fi
+
+      - name: Done
+        run: |
+          echo "✅ Done! Download result.obj + result_texture.png from the repo"
+          echo "Load result.obj in viewer/3d_viewer.html"
