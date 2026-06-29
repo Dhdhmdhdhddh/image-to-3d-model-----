@@ -1,0 +1,10 @@
+*.pyc
+__pycache__/
+*.obj
+*.glb
+*.stl
+*.png
+*.jpg
+*.jpeg
+!viewer/
+.DS_Store
