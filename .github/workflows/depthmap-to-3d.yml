@@ -22,30 +22,31 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find input image
+      - name: Install ImageMagick + AVIF + HEIC support
         run: |
-          IMG=$(ls input/*.jpg input/*.jpeg input/*.png input/*.webp 2>/dev/null | grep -v .gitkeep | head -1)
+          sudo apt-get update -qq
+          sudo apt-get install -y imagemagick libheif-dev libavif-dev webp ffmpeg
+          # allow all formats in imagemagick policy
+          sudo sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' /etc/ImageMagick-6/policy.xml || true
+
+      - name: Find and normalize input image
+        run: |
+          # Find any image file in input/ (almost any format)
+          IMG=$(find input/ -type f ! -name '.gitkeep' ! -name '*.md' | head -1)
           if [ -z "$IMG" ]; then
             echo "ERROR: no image found in input/ folder"
-            echo "Upload any photo (jpg, png, webp) to the input/ folder and re-run"
             exit 1
           fi
           echo "Found: $IMG"
-          echo "IMG=$IMG" >> $GITHUB_ENV
+          # Convert to PNG using imagemagick (supports 200+ formats)
+          convert "$IMG[0]" -flatten -strip input/normalized.png
+          echo "Converted to PNG"
+          echo "IMG=input/normalized.png" >> $GITHUB_ENV
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install timm pillow numpy opencv-python-headless
-
-      - name: Download MiDaS model
-        run: |
-          python - <<'PYEOF'
-          import torch
-          print("Downloading MiDaS DPT_Large model...")
-          midas = torch.hub.load("intel-isl/MiDaS", "DPT_Large", trust_repo=True)
-          print("Done")
-          PYEOF
 
       - name: Generate depth map with MiDaS
         run: |
@@ -57,18 +58,15 @@ jobs:
           img_path = os.environ["IMG"]
           print(f"Processing: {img_path}")
 
-          # Load MiDaS
           midas = torch.hub.load("intel-isl/MiDaS", "DPT_Large", trust_repo=True)
           device = torch.device("cpu")
           midas.to(device).eval()
           transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
           transform = transforms.dpt_transform
 
-          # Load and process image
           img = cv2.imread(img_path)
           img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-          # Resize if too large (saves memory on CPU)
           h, w = img_rgb.shape[:2]
           if max(h, w) > 800:
               scale = 800 / max(h, w)
@@ -77,7 +75,7 @@ jobs:
 
           input_batch = transform(img_rgb).to(device)
 
-          print("Running MiDaS depth estimation (this takes a few mins on CPU)...")
+          print("Running MiDaS (this takes a few mins on CPU)...")
           with torch.no_grad():
               prediction = midas(input_batch)
               prediction = torch.nn.functional.interpolate(
@@ -90,15 +88,11 @@ jobs:
           depth = prediction.cpu().numpy()
           depth_norm = (depth - depth.min()) / (depth.max() - depth.min())
 
-          # Save depthmap
           os.makedirs("output", exist_ok=True)
-          depth_img = Image.fromarray((depth_norm * 255).astype("uint8"))
-          depth_img.save("output/depthmap.png")
-
-          # Save resized photo for texture
+          Image.fromarray((depth_norm * 255).astype("uint8")).save("output/depthmap.png")
           Image.fromarray(img_rgb).save("output/photo_resized.png")
           np.save("output/depth.npy", depth_norm)
-          print("Depth map saved")
+          print("Done")
           PYEOF
 
       - name: Convert depthmap → OBJ mesh
@@ -116,23 +110,18 @@ jobs:
           H, W = depth_norm.shape
           MW, MH = W // scale, H // scale
 
-          from PIL import Image as PILImage
-          depth_small = np.array(PILImage.fromarray(depth_norm).resize((MW, MH), PILImage.LANCZOS), dtype=np.float32)
-          # normalize again after resize
+          depth_small = np.array(Image.fromarray(depth_norm).resize((MW, MH), Image.LANCZOS), dtype=np.float32)
           depth_small = (depth_small - depth_small.min()) / (depth_small.max() - depth_small.min() + 1e-8)
-          photo_small = np.array(photo.resize((MW, MH), PILImage.LANCZOS), dtype=np.float32) / 255.0
+          photo_small = np.array(photo.resize((MW, MH), Image.LANCZOS), dtype=np.float32) / 255.0
 
           print(f"Building mesh: {MW}x{MH} = {MW*MH:,} verts")
 
           positions, colors, uvs, indices = [], [], [], []
           for y in range(MH):
               for x in range(MW):
-                  vx = (x / (MW-1)) * 2 - 1
-                  vy = -((y / (MH-1)) * 2 - 1)
-                  vz = float(depth_small[y, x]) * height_scale
-                  positions.append((vx, vy, vz))
-                  r, g, b = photo_small[y, x, :3]
-                  colors.append((float(r), float(g), float(b)))
+                  positions.append(((x/(MW-1))*2-1, -((y/(MH-1))*2-1), float(depth_small[y,x])*height_scale))
+                  r,g,b = photo_small[y,x,:3]
+                  colors.append((float(r),float(g),float(b)))
                   uvs.append((x/(MW-1), 1-y/(MH-1)))
 
           for y in range(MH-1):
@@ -140,31 +129,26 @@ jobs:
                   a=y*MW+x; b=y*MW+x+1; c=(y+1)*MW+x+1; d=(y+1)*MW+x
                   indices.extend([(a,b,c),(a,c,d)])
 
-          # Normals
           pos_arr = np.array(positions)
           norms = np.zeros_like(pos_arr)
           for tri in indices:
-              a,b,c = pos_arr[tri[0]], pos_arr[tri[1]], pos_arr[tri[2]]
-              n = np.cross(b-a, c-a)
+              a,b,c = pos_arr[tri[0]],pos_arr[tri[1]],pos_arr[tri[2]]
+              n = np.cross(b-a,c-a)
               l = np.linalg.norm(n)
-              if l > 0:
-                  n /= l
-                  norms[tri[0]] += n; norms[tri[1]] += n; norms[tri[2]] += n
-          lens = np.linalg.norm(norms, axis=1, keepdims=True)
-          lens[lens==0] = 1
-          norms /= lens
+              if l>0:
+                  n/=l
+                  norms[tri[0]]+=n; norms[tri[1]]+=n; norms[tri[2]]+=n
+          lens = np.linalg.norm(norms,axis=1,keepdims=True)
+          lens[lens==0]=1
+          norms/=lens
 
-          # Save texture
           photo.save("output/result_texture.png")
-
-          # Write MTL
-          with open("output/result.mtl", "w") as f:
+          with open("output/result.mtl","w") as f:
               f.write("newmtl material0\nmap_Kd result_texture.png\n")
 
-          # Write OBJ
-          with open("output/result.obj", "w") as f:
-              f.write("# Image → 3D mesh via MiDaS + GitHub Actions\nmtllib result.mtl\n\n")
-              for v,c in zip(positions, colors):
+          with open("output/result.obj","w") as f:
+              f.write("# Image → 3D via MiDaS + GitHub Actions\nmtllib result.mtl\n\n")
+              for v,c in zip(positions,colors):
                   f.write(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f} {c[0]:.3f} {c[1]:.3f} {c[2]:.3f}\n")
               f.write("\n")
               for uv in uvs:
@@ -174,7 +158,7 @@ jobs:
                   f.write(f"vn {n[0]:.4f} {n[1]:.4f} {n[2]:.4f}\n")
               f.write("\nusemtl material0\n\n")
               for tri in indices:
-                  a,b,c = tri[0]+1,tri[1]+1,tri[2]+1
+                  a,b,c=tri[0]+1,tri[1]+1,tri[2]+1
                   f.write(f"f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}\n")
 
           print(f"✅ result.obj — {len(positions):,} verts, {len(indices):,} tris")
@@ -185,7 +169,7 @@ jobs:
 
       - name: Wipe input, commit output
         run: |
-          rm -f input/*.jpg input/*.jpeg input/*.png input/*.webp
+          find input/ -type f ! -name '.gitkeep' -delete
           touch input/.gitkeep output/.gitkeep
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -194,4 +178,4 @@ jobs:
           git push origin HEAD
 
       - name: Done
-        run: echo "✅ Download result.obj + result_texture.png from the output/ folder. Load in viewer/3d_viewer.html"
+        run: echo "✅ Download result.obj + result_texture.png from output/ and load in viewer/3d_viewer.html"
